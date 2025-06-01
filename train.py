@@ -1,7 +1,7 @@
+import os
 import torchaudio
 from audiocraft.models import MusicGen
 from transformers import get_scheduler
-import torch
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -10,10 +10,8 @@ import random
 import wandb
 import json
 from torch.utils.data import Dataset
-
 from audiocraft.modules.conditioners import ClassifierFreeGuidanceDropout
 
-import os
 
 
 class AudioDataset(Dataset):
@@ -34,13 +32,6 @@ class AudioDataset(Dataset):
         return entry["path"], entry["description"]
 
 
-
-def count_nans(tensor):
-    nan_mask = torch.isnan(tensor)
-    num_nans = torch.sum(nan_mask).item()
-    return num_nans
-
-
 def preprocess_audio(audio_path, model: MusicGen, duration: int = 30):
     wav, sr = torchaudio.load(audio_path)
     wav = torchaudio.functional.resample(wav, sr, model.sample_rate)
@@ -51,37 +42,20 @@ def preprocess_audio(audio_path, model: MusicGen, duration: int = 30):
     start_sample = random.randrange(0, max(wav.shape[1] - end_sample, 1))
     wav = wav[:, start_sample : start_sample + end_sample]
 
-    assert wav.shape[0] == 1
-
-    wav = wav.cuda()
-    wav = wav.unsqueeze(1)
-
+    wav = wav.cuda().unsqueeze(1)
     with torch.no_grad():
         gen_audio = model.compression_model.encode(wav)
-
     codes, scale = gen_audio
-
-    assert scale is None
-
     return codes
-
-
-def fixnan(tensor: torch.Tensor):
-    nan_mask = torch.isnan(tensor)
-    result = torch.where(nan_mask, torch.zeros_like(tensor), tensor)
-
-    return result
 
 
 def one_hot_encode(tensor, num_classes=2048):
     shape = tensor.shape
-    one_hot = torch.zeros((shape[0], shape[1], num_classes))
-
+    one_hot = torch.zeros((shape[0], shape[1], num_classes), device=tensor.device)
     for i in range(shape[0]):
         for j in range(shape[1]):
             index = tensor[i, j].item()
             one_hot[i, j, index] = 1
-
     return one_hot
 
 
@@ -105,27 +79,14 @@ def train(
         run = wandb.init(project="audiocraft")
 
     model = MusicGen.get_pretrained(model_id)
-    model.lm = model.lm.to(torch.float32)  # important
+    model.lm = model.lm.to(torch.float32)
 
     dataset = AudioDataset(dataset_path)
     train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    learning_rate = lr
-    model.lm.train()
-
-    scaler = torch.cuda.amp.GradScaler()
-
-    if tune_text:
-        print("Tuning text")
-    else:
-        print("Tuning everything")
-
-    # from paper
     optimizer = AdamW(
-        model.lm.condition_provider.parameters()
-        if tune_text
-        else model.lm.parameters(),
-        lr=learning_rate,
+        model.lm.condition_provider.parameters() if tune_text else model.lm.parameters(),
+        lr=lr,
         betas=(0.9, 0.95),
         weight_decay=weight_decay,
     )
@@ -138,50 +99,37 @@ def train(
 
     criterion = nn.CrossEntropyLoss()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    scaler = torch.cuda.amp.GradScaler()
 
-    num_epochs = epochs
-
-    save_step = save_step
-    save_models = False if save_step is None else True
-
-    save_path = "models/"
-
-    os.makedirs(save_path, exist_ok=True)
-
+    save_models = save_step is not None
+    os.makedirs("models/", exist_ok=True)
     current_step = 0
 
-    for epoch in range(num_epochs):
-        for batch_idx, (audio, label) in enumerate(train_dataloader):
+    for epoch in range(epochs):
+        for batch_idx, (audio, text) in enumerate(train_dataloader):
             optimizer.zero_grad()
-
             all_codes = []
             texts = []
 
-            # where audio and label are just paths
-            for inner_audio, l in zip(audio, label):
-                inner_audio = preprocess_audio(inner_audio, model)
-                if inner_audio is None:
+            for audio_path, label in zip(audio, text):
+                codes = preprocess_audio(audio_path, model)
+                if codes is None:
                     continue
-
-                if use_cfg:
-                    codes = torch.cat([inner_audio, inner_audio], dim=0)
-                else:
-                    codes = inner_audio
-
+                codes = torch.cat([codes, codes], dim=0) if use_cfg else codes
                 all_codes.append(codes)
-                texts.append(l)
+                texts.append(label)
+
+            if len(all_codes) == 0:
+                continue
 
             attributes, _ = model._prepare_tokens_and_attributes(texts, None)
             conditions = attributes
             if use_cfg:
                 null_conditions = ClassifierFreeGuidanceDropout(p=1.0)(conditions)
                 conditions = conditions + null_conditions
-            tokenized = model.lm.condition_provider.tokenize(conditions)
-            cfg_conditions = model.lm.condition_provider(tokenized)
-            condition_tensors = cfg_conditions
 
-            if len(all_codes) == 0:
-                continue
+            tokenized = model.lm.condition_provider.tokenize(conditions)
+            condition_tensors = model.lm.condition_provider(tokenized)
 
             codes = torch.cat(all_codes, dim=0)
 
@@ -190,48 +138,24 @@ def train(
                     codes=codes, conditions=[], condition_tensors=condition_tensors
                 )
 
-                codes = codes[0]
                 logits = lm_output.logits[0]
                 mask = lm_output.mask[0]
+                targets = one_hot_encode(codes[0], num_classes=2048)
 
-                codes = one_hot_encode(codes, num_classes=2048)
-
-                codes = codes.cuda()
                 logits = logits.cuda()
-                mask = mask.cuda()
-
-                mask = mask.view(-1)
+                mask = mask.cuda().view(-1)
                 masked_logits = logits.view(-1, 2048)[mask]
-                masked_codes = codes.view(-1, 2048)[mask]
+                masked_targets = targets.view(-1, 2048)[mask]
 
-                loss = criterion(masked_logits, masked_codes)
+                loss = criterion(masked_logits, masked_targets)
 
             current_step += 1 / grad_acc
-
-            # assert count_nans(masked_logits) == 0
-
             (scaler.scale(loss) if use_scaler else loss).backward()
 
-            total_norm = 0
-            for p in model.lm.condition_provider.parameters():
-                try:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-                except AttributeError:
-                    pass
-            total_norm = total_norm ** (1.0 / 2)
-
             if use_wandb:
-                run.log(
-                    {
-                        "loss": loss.item(),
-                        "total_norm": total_norm,
-                    }
-                )
+                wandb.log({"loss": loss.item()})
 
-            print(
-                f"Epoch: {epoch}/{num_epochs}, Batch: {batch_idx}/{len(train_dataloader)}, Loss: {loss.item()}"
-            )
+            print(f"Epoch {epoch} Batch {batch_idx}: Loss = {loss.item():.4f}")
 
             if batch_idx % grad_acc != grad_acc - 1:
                 continue
@@ -239,7 +163,6 @@ def train(
             if use_scaler:
                 scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.lm.parameters(), 0.5)
-
             if use_scaler:
                 scaler.step(optimizer)
                 scaler.update()
@@ -247,21 +170,16 @@ def train(
                 optimizer.step()
             scheduler.step()
 
-            if save_models:
-                if (
-                    current_step == int(current_step)
-                    and int(current_step) % save_step == 0
-                ):
-                    torch.save(
-                        model.lm.state_dict(), f"{save_path}/lm_{current_step}.pt"
-                    )
+            if save_models and int(current_step) % save_step == 0:
+                torch.save(model.lm.state_dict(), f"models/lm_{int(current_step)}.pt")
 
-    torch.save(model.lm.state_dict(), f"{save_path}/lm_final.pt")
+    torch.save(model.lm.state_dict(), "models/lm_final.pt")
+
 
 if __name__ == "__main__":
     train(
-        dataset_path="audiocraft_data/train.jsonl",
-        model_id="facebook/musicgen-small",
+        dataset_path="train_gpt.jsonl",
+        model_id="facebook/musicgen-medium",
         lr=1e-4,
         epochs=5,
         use_wandb=False,
