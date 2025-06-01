@@ -2,3 +2,10 @@
 /audio_wav/
 *.csv
 *.zip.*
+/audiocraft/
+/audiocraft_data/
+/fma_medium/
+/fma_metadata
+/fma_wav/
+/downloads/
+/models/
